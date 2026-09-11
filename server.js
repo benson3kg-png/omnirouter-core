@@ -1,118 +1,102 @@
-const fastify = require('fastify')({ logger: false });
+const http = require('http');
 const crypto = require('crypto');
 
-const PORT = 3000;
-const WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET || 'OMNIROUTER_SIGNING_SECRET_LOGIC';
+const port = 3000;
+const secret = process.env.WEBHOOK_SIGNING_SECRET || 'OMNIROUTER_SIGNING_SECRET_LOGIC';
 
-
-// =========================================================================
-// THE ENTERPRISE LEDGER REGISTRY
-// =========================================================================
-const ledgerStateRegistry = new Map([
+const registry = new Map([
     ["account_source_01", { label: "Client Account Core", currency: "GHS", balance: 50000.00, nonce: 0 }],
     ["vault_liquidity_src", { label: "Regional Liquidity Pool GHS", currency: "GHS", balance: 500000.00, nonce: 0 }],
     ["vault_liquidity_dst", { label: "Global Settlement Pool USD", currency: "USD", balance: 150000.00, nonce: 0 }],
     ["account_destination_01", { label: "Merchant Account Core", currency: "USD", balance: 100.00, nonce: 0 }]
 ]);
 
-// CONCURRENCY MUTEX ISOLATION GRID
-const lockedResourceRegistry = new Set();
+const locks = new Set();
+const FEE_RATE = 0.005; 
+const FX_RATE = 0.065; 
 
-const COMPUTE_ROUTER_FEE_RATE = 0.005; 
-const MATRIX_FX_CONVERSION_RATE = 0.065; 
+const server = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
 
-// =========================================================================
-// TRANSACTION INGESTION PIPELINE ENDPOINT
-// =========================================================================
-fastify.post('/api/v3/omnirouter/settle', async (request, reply) => {
-    const rawPayloadString = JSON.stringify(request.body);
-    const networkPayloadSignature = request.headers['x-omnirouter-signature'];
+    if (req.method === 'POST' && req.url === '/api/v3/omnirouter/settle') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const sig = req.headers['x-omnirouter-signature'];
+                const expected = crypto.createHmac('sha256', secret).update(body).digest('hex');
 
-    // 1. CRYPTOGRAPHIC PERIMETER SECURITY FILTER
-    const expectedPayloadSignature = crypto
-        .createHmac('sha256', WEBHOOK_SIGNING_SECRET)
-        .update(rawPayloadString)
-        .digest('hex');
+                if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expected, 'utf8'))) {
+                    res.writeHead(401);
+                    return res.end(JSON.stringify({ error: "AUTH_FAILED" }));
+                }
 
-    if (!networkPayloadSignature || !crypto.timingSafeEqual(Buffer.from(networkPayloadSignature, 'utf8'), Buffer.from(expectedPayloadSignature, 'utf8'))) {
-        return reply.status(401).send({ error: "SECURITY_UNAUTHORIZED_PAYLOAD_SIGNATURE_MISMATCH" });
-    }
+                const data = JSON.parse(body);
+                const src = data.sourceAccountToken;
+                const dst = data.destinationAccountToken;
+                const amt = data.settlementVolumeGross;
 
-    const { sourceAccountToken, destinationAccountToken, settlementVolumeGross } = request.body;
+                if (locks.has(src)) {
+                    res.writeHead(423);
+                    return res.end(JSON.stringify({ error: "LOCKED" }));
+                }
+                
+                locks.add(src);
 
-    // 2. CONCURRENCY MUTEX SHIELD (THE PRODUCTION TIMING FIX)
-    // If a request is actively processing this specific key resource, deny duplicate concurrent entry
-    if (lockedResourceRegistry.has(sourceAccountToken)) {
-        console.warn(`⚠️ [RACE CONDITION REJECTED]: Intercepted concurrent collision on resource: ${sourceAccountToken}`);
-        return reply.status(423).send({ error: "RESOURCE_LOCKED_CONCURRENT_TRANSACTION_IN_PROGRESS" });
-    }
-    
-    // Lock the account token instantly before evaluating any storage mutations
-    lockedResourceRegistry.add(sourceAccountToken);
+                const snapSrc = { ...registry.get(src) };
+                const snapDst = { ...registry.get(dst) };
+                const snapV1 = { ...registry.get("vault_liquidity_src") };
+                const snapV2 = { ...registry.get("vault_liquidity_dst") };
 
-    // 3. SHALLOW DELTA-STATE ISOLATION CAPTURE
-    const sourceInitialSnapshot = { ...ledgerStateRegistry.get(sourceAccountToken) };
-    const destinationInitialSnapshot = { ...ledgerStateRegistry.get(destinationAccountToken) };
-    const localPoolInitialSnapshot = { ...ledgerStateRegistry.get("vault_liquidity_src") };
-    const foreignPoolInitialSnapshot = { ...ledgerStateRegistry.get("vault_liquidity_dst") };
+                try {
+                    const nodeSrc = registry.get(src);
+                    const nodeDst = registry.get(dst);
+                    const nodeV1 = registry.get("vault_liquidity_src");
+                    const nodeV2 = registry.get("vault_liquidity_dst");
 
-    try {
-        const sourceNodeRef = ledgerStateRegistry.get(sourceAccountToken);
-        const destinationNodeRef = ledgerStateRegistry.get(destinationAccountToken);
-        const sourcePoolNodeRef = ledgerStateRegistry.get("vault_liquidity_src");
-        const targetPoolNodeRef = ledgerStateRegistry.get("vault_liquidity_dst");
+                    if (nodeSrc.balance < amt) throw new Error("INSUFFICIENT_FUNDS");
 
-        // 4. DATA INVARIANT CHECKS
-        if (sourceNodeRef.balance < settlementVolumeGross) {
-            throw new Error("INVARIANT_VIOLATION_INSUFFICIENT_SOURCE_LIQUIDITY");
-        }
+                    const fee = amt * FEE_RATE;
+                    const net = amt - fee;
+                    const payout = net * FX_RATE;
 
-        const computationalInfrastructureFee = settlementVolumeGross * COMPUTE_ROUTER_FEE_RATE;
-        const settlementVolumeNet = settlementVolumeGross - computationalInfrastructureFee;
-        const clearingTargetPayout = settlementVolumeNet * MATRIX_FX_CONVERSION_RATE;
+                    if (nodeV2.balance < payout) throw new Error("POOL_EXHAUSTED");
 
-        if (targetPoolNodeRef.balance < clearingTargetPayout) {
-            throw new Error("INVARIANT_VIOLATION_TARGET_POOL_CAPITAL_EXHAUSTED");
-        }
+                    nodeSrc.nonce += 1;
+                    nodeSrc.balance -= amt;
+                    nodeV1.balance += amt;
+                    nodeV2.balance -= payout;
+                    nodeDst.balance += payout;
 
-        // 5. ATOMIC SYSTEM TRANSACTION COMMIT
-        sourceNodeRef.nonce += 1;
-        sourceNodeRef.balance -= settlementVolumeGross;
-        sourcePoolNodeRef.balance += settlementVolumeGross;
-        targetPoolNodeRef.balance -= clearingTargetPayout;
-        destinationNodeRef.balance += clearingTargetPayout;
+                    setTimeout(() => { locks.delete(src); }, 50);
 
-        // SEALING THE LEAK: Artificially hold the lock open for 50 milliseconds inside the event queue
-        // This ensures the processing thread blocks all concurrent network packets arriving in the same microsecond pool
-        setTimeout(() => {
-            lockedResourceRegistry.delete(sourceAccountToken);
-        }, 50);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({
+                        status: "COMMITTED",
+                        payout: payout,
+                        nonce: nodeSrc.nonce
+                    }));
 
-        console.log(`🚀 [OMNIROUTER COMMIT]: Atomic state change executed. Nonce: ${sourceNodeRef.nonce}`);
-        
-        return {
-            execution_state: "COMMITTED_SUCCESSFULLY",
-            cleared_volume_target_currency: clearingTargetPayout,
-            audit_sequence_nonce: sourceNodeRef.nonce
-        };
+                } catch (err) {
+                    registry.set(src, snapSrc);
+                    registry.set(dst, snapDst);
+                    registry.set("vault_liquidity_src", snapV1);
+                    registry.set("vault_liquidity_dst", snapV2);
+                    locks.delete(src);
 
-    } catch (error) {
-        // 6. ROLLBACK REVERSION
-        console.error(`❌ [OMNIROUTER CRASH - EXECUTING COMPENSATING REVERSION]: ${error.message}`);
-        
-        ledgerStateRegistry.set(sourceAccountToken, sourceInitialSnapshot);
-        ledgerStateRegistry.set(destinationAccountToken, destinationInitialSnapshot);
-        ledgerStateRegistry.set("vault_liquidity_src", localPoolInitialSnapshot);
-        ledgerStateRegistry.set("vault_liquidity_dst", foreignPoolInitialSnapshot);
-
-        // Immediate release on system breakdown to allow core recovery
-        lockedResourceRegistry.delete(sourceAccountToken);
-        
-        return reply.status(500).send({ error: "TRANSACTION_REFUSED_LEDGER_STATE_REVERTED", diagnostic_token: error.message });
+                    res.writeHead(500);
+                    res.end(JSON.stringify({ error: "REVERTED", code: err.message }));
+                }
+                body = null;
+            } catch (ex) {
+                res.writeHead(500);
+                res.end(JSON.stringify({ error: "ERR_PARSE" }));
+            }
+        });
+    } else {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: "NOT_FOUND" }));
     }
 });
 
-fastify.listen({ port: PORT }, (err) => {
-    if (err) process.exit(1);
-    console.log(`🛡️ [THE HARDENED OMNIROUTER ONLINE]: Concurrency loop sealed on Port ${PORT}`);
-});
+server.listen(port, '::');
